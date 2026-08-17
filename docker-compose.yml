@@ -1,4 +1,12 @@
-
+# Local Docker setup for the NinjaOne MCP server.
+#
+# Quick start:
+#   cp .env.example .env          # fill in your NinjaOne credentials
+#   export GITHUB_TOKEN=$(gh auth token)   # read:packages, needed at BUILD time
+#   docker compose up --build
+#
+# The server then listens on http://localhost:8080/mcp (health: /health).
+# See the "Running Locally with Docker" section of README.md for details.
 
 services:
   ninjaone-mcp:
@@ -6,25 +14,47 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
+      # The @wyre-technology/node-ninjaone dependency lives on GitHub Packages,
+      # which has no anonymous read. The token is passed as a BuildKit secret so
+      # it never lands in the image layers. Accepts GITHUB_TOKEN or the
+      # NODE_AUTH_TOKEN name used by .npmrc / CI.
+      secrets:
+        - github_token
     image: ninjaone-mcp:latest
     container_name: ninjaone-mcp-server
     restart: unless-stopped
     env_file:
-      - .env
+      # Optional: `docker compose up` still works with no .env file, as long as
+      # the credentials below are exported in your shell instead.
+      - path: .env
+        required: false
     environment:
-      # Required NinjaOne credentials (set these in .env file)
-      - NINJAONE_CLIENT_ID=${NINJAONE_CLIENT_ID}
-      - NINJAONE_CLIENT_SECRET=${NINJAONE_CLIENT_SECRET}
+      # Required NinjaOne credentials. Listed without a value so they pass
+      # through from .env or your shell — and so `docker compose build` and
+      # `config` still work before credentials exist.
+      - NINJAONE_CLIENT_ID
+      - NINJAONE_CLIENT_SECRET
 
-      # Optional configuration
+      # Optional NinjaOne configuration
       - NINJAONE_REGION=${NINJAONE_REGION:-us}
-      - MCP_SERVER_NAME=${MCP_SERVER_NAME:-ninjaone-mcp}
+      # Narrow this if your NinjaOne API app was granted fewer scopes than
+      # `monitoring management`, or the token exchange fails with invalid_scope.
+      - NINJAONE_SCOPES
+
+      # Transport: HTTP so the container is reachable from the host.
+      # AUTH_MODE=env reads the credentials above; use `gateway` only when a
+      # gateway injects per-request X-Ninja-* headers.
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_PORT=8080
+      - MCP_HTTP_HOST=0.0.0.0
+      - AUTH_MODE=${AUTH_MODE:-env}
 
       # Logging configuration
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NODE_ENV=production
     ports:
-      - "8080:8080"
+      # Change the host port with HOST_PORT=9090 if 8080 is taken locally.
+      - "${HOST_PORT:-8080}:8080"
     volumes:
       # Mount logs directory for persistence
       - ninjaone-mcp-logs:/app/logs
@@ -47,29 +77,76 @@ services:
           cpus: '0.1'
           memory: 128M
 
-  # Development service - runs once for testing, doesn't restart
+  # Build-free service: runs the published upstream image instead of compiling
+  # from source, so it needs no GitHub token at all. Use this to try the server
+  # locally without a read:packages PAT.
+  #   docker compose --profile prebuilt up ninjaone-mcp-prebuilt
+  # The published image is linux/amd64 only, so it runs under emulation on
+  # Apple Silicon — fine for local use, a little slower to start.
+  ninjaone-mcp-prebuilt:
+    profiles: ["prebuilt"]
+    image: ${PREBUILT_IMAGE:-ghcr.io/wyre-technology/ninjaone-mcp:latest}
+    platform: ${PREBUILT_PLATFORM:-linux/amd64}
+    container_name: ninjaone-mcp-prebuilt
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NINJAONE_CLIENT_ID
+      - NINJAONE_CLIENT_SECRET
+      - NINJAONE_REGION=${NINJAONE_REGION:-us}
+      - NINJAONE_SCOPES
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_PORT=8080
+      - MCP_HTTP_HOST=0.0.0.0
+      - AUTH_MODE=${AUTH_MODE:-env}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development service: rebuilds from source on change and restarts the server.
+  # Run with: docker compose --profile dev up --build ninjaone-mcp-dev
   ninjaone-mcp-dev:
     profiles: ["dev"]
     build:
       context: .
       dockerfile: Dockerfile
       target: builder
+      secrets:
+        - github_token
     image: ninjaone-mcp:dev
     container_name: ninjaone-mcp-dev
     working_dir: /app
     restart: "no"
-    command: npm run dev
+    # tsc --watch rebuilds dist/ on save; --watch on node restarts the process
+    # when dist/ changes, so edits under src/ take effect without a rebuild.
+    command: sh -c "npm run dev & exec node --watch-path=./dist dist/index.js"
     environment:
-      # Development environment variables
       - NODE_ENV=development
       - LOG_LEVEL=${LOG_LEVEL:-debug}
 
       # NinjaOne credentials
-      - NINJAONE_CLIENT_ID=${NINJAONE_CLIENT_ID}
-      - NINJAONE_CLIENT_SECRET=${NINJAONE_CLIENT_SECRET}
+      - NINJAONE_CLIENT_ID
+      - NINJAONE_CLIENT_SECRET
       - NINJAONE_REGION=${NINJAONE_REGION:-us}
+      - NINJAONE_SCOPES
+
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_PORT=8080
+      - MCP_HTTP_HOST=0.0.0.0
+      - AUTH_MODE=${AUTH_MODE:-env}
     env_file:
-      - .env
+      - path: .env
+        required: false
+    ports:
+      - "${DEV_HOST_PORT:-8081}:8080"
     volumes:
       # Mount source code for hot reload in development
       - .:/app
@@ -78,14 +155,14 @@ services:
     stdin_open: true
     tty: true
 
+secrets:
+  github_token:
+    # Read from the GITHUB_TOKEN variable — exported in your shell or set in
+    # .env. Needs the read:packages scope; only used at build time.
+    environment: GITHUB_TOKEN
+
 volumes:
   ninjaone-mcp-logs:
     driver: local
   ninjaone-mcp-dev-logs:
     driver: local
-
-# Example .env file structure (create this file with your actual credentials):
-# NINJAONE_CLIENT_ID=your-client-id
-# NINJAONE_CLIENT_SECRET=your-client-secret
-# NINJAONE_REGION=us
-# LOG_LEVEL=info
