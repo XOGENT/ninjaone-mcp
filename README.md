@@ -3,6 +3,14 @@
 A Model Context Protocol (MCP) server for interacting with NinjaOne, featuring a decision tree architecture for efficient tool loading.
 
 
+> [!NOTE]
+> This is the **XOGENT fork** of [`wyre-technology/ninjaone-mcp`](https://github.com/wyre-technology/ninjaone-mcp).
+> The deploy buttons and `.do/app.yaml` below point at `XOGENT/ninjaone-mcp`, so
+> they deploy *this* fork. The npm dependency
+> (`@wyre-technology/node-ninjaone`) is still pulled from the upstream org's
+> GitHub Packages registry — that has not changed, and neither has the token
+> requirement described below.
+
 ## One-Click Deployment
 
 > [!IMPORTANT]
@@ -15,16 +23,18 @@ A Model Context Protocol (MCP) server for interacting with NinjaOne, featuring a
 > 1. Create a GitHub **Personal Access Token** with the `read:packages` scope
 >    ([classic token](https://github.com/settings/tokens/new?scopes=read:packages&description=ninjaone-mcp%20deploy)).
 >    Any GitHub account works — you do **not** need to be a member of the
->    `wyre-technology` org to read its public packages.
+>    `wyre-technology` or `XOGENT` org to read the public package. The scope really
+>    is required: a token without `read:packages` gets `403 ... does not match
+>    expected scopes` rather than a clean 401, so double-check it.
 > 2. Add it as a build variable when prompted by the deploy flow:
 >    - **Cloudflare Workers** → set a build variable named **`NODE_AUTH_TOKEN`** to your PAT
 >      (Workers → Settings → Build → Variables and Secrets).
 >    - **DigitalOcean App Platform** → set an encrypted env var named **`GITHUB_TOKEN`**
 >      with scope **Build Time** to your PAT (the `.do/app.yaml` already declares it).
 
-[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/wyre-technology/ninjaone-mcp/tree/main)
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/XOGENT/ninjaone-mcp/tree/main)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wyre-technology/ninjaone-mcp)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/XOGENT/ninjaone-mcp)
 
 > [!NOTE]
 > Both targets run the **full** MCP server. DigitalOcean builds the Docker image and
@@ -34,6 +44,10 @@ A Model Context Protocol (MCP) server for interacting with NinjaOne, featuring a
 > and optionally `NINJAONE_REGION` — or set `AUTH_MODE=gateway` to take credentials
 > per-request from `X-Ninja-*` headers. The MCP endpoint is `/mcp`; `/health` is an
 > unauthenticated liveness probe.
+
+Want to run it on your own machine first? See
+[Running Locally with Docker](#running-locally-with-docker) — the prebuilt-image
+path needs no token at all.
 
 ## Architecture
 
@@ -124,11 +138,101 @@ Add to your Claude Desktop `claude_desktop_config.json`:
 }
 ```
 
-### Docker
+## Running Locally with Docker
+
+`docker-compose.yml` defines three ways to run the server locally. All of them
+serve the MCP endpoint at `http://localhost:8080/mcp`, with `/health` as an
+unauthenticated liveness probe.
+
+First, create your `.env`:
 
 ```bash
-docker build -t ninjaone-mcp .
-docker run -e NINJAONE_CLIENT_ID=xxx -e NINJAONE_CLIENT_SECRET=xxx -e NINJAONE_REGION=us ninjaone-mcp
+cp .env.example .env
+```
+
+Fill in `NINJAONE_CLIENT_ID` and `NINJAONE_CLIENT_SECRET` (see
+[Authentication](#authentication) for how to create the API app). Every other
+variable has a working default. `.env` is gitignored and excluded from the Docker
+build context.
+
+### Option A — prebuilt image (no GitHub token needed)
+
+The fastest path: pull the published image instead of compiling from source, so
+the GitHub Packages token is never involved.
+
+```bash
+docker compose --profile prebuilt up ninjaone-mcp-prebuilt
+```
+
+```bash
+curl http://localhost:8080/health
+```
+
+The published image is `linux/amd64` only, so on Apple Silicon it runs under
+emulation — slightly slower to start, otherwise identical. Override the image or
+platform with `PREBUILT_IMAGE` / `PREBUILT_PLATFORM` in `.env` if you publish
+your own.
+
+### Option B — build from source
+
+Building runs `npm ci`, which installs `@wyre-technology/node-ninjaone` from
+GitHub Packages and therefore **requires a token with the `read:packages` scope**
+([create one](https://github.com/settings/tokens/new?scopes=read:packages&description=ninjaone-mcp%20local)).
+A plain `gh auth token` is usually *not* enough — the default `gh` scopes omit
+`read:packages`, and you'll get `npm error code E403 ... does not match expected
+scopes`.
+
+```bash
+export GITHUB_TOKEN=ghp_your_token_with_read_packages
+```
+
+```bash
+docker compose up --build ninjaone-mcp
+```
+
+The token is passed as a BuildKit secret, so it never lands in the image layers.
+You can also put `GITHUB_TOKEN=` in `.env` instead of exporting it.
+
+### Option C — development, with rebuild-on-save
+
+Mounts your working tree into the container, recompiles TypeScript on save, and
+restarts the server when `dist/` changes. Published on port **8081** so it can
+run alongside Option A or B.
+
+```bash
+docker compose --profile dev up --build ninjaone-mcp-dev
+```
+
+### Connecting a client
+
+Point any Streamable-HTTP MCP client at `http://localhost:8080/mcp`. To check it
+by hand:
+
+```bash
+curl -s -X POST http://localhost:8080/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+For Claude Desktop, the stdio transport is usually a better fit than a container
+— see [Claude Desktop Configuration](#claude-desktop-configuration) above.
+
+### Local Docker troubleshooting
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| `npm error code E403 ... does not match expected scopes` during build | Your `GITHUB_TOKEN` lacks `read:packages`. Create a new PAT with that scope, or use Option A. |
+| `npm error 401 Unauthorized ... npm.pkg.github.com` during build | No token reached the build. Export `GITHUB_TOKEN` (or set it in `.env`) before `docker compose up --build`. |
+| `Bind for 0.0.0.0:8080 failed: port is already allocated` | Something else owns port 8080. Set `HOST_PORT=9090` in `.env`. |
+| `/health` returns `ok` but every tool call fails auth | Credentials are missing or wrong, or `AUTH_MODE=gateway` is set without a gateway. `/health` is deliberately shallow and never checks credentials. |
+| Token exchange fails with `400 invalid_scope` | Your NinjaOne API app was granted fewer scopes than the `monitoring management` default. Set `NINJAONE_SCOPES` to match — see [OAuth scopes](#oauth-scopes). |
+
+### Plain `docker` (without compose)
+
+```bash
+docker build --secret id=github_token,env=GITHUB_TOKEN -t ninjaone-mcp .
+```
+
+```bash
+docker run --rm -p 8080:8080 -e MCP_TRANSPORT=http -e AUTH_MODE=env -e NINJAONE_CLIENT_ID=xxx -e NINJAONE_CLIENT_SECRET=xxx -e NINJAONE_REGION=us ninjaone-mcp
 ```
 
 ## Available Domains

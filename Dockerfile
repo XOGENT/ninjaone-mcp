@@ -13,11 +13,23 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies with GitHub Packages auth
-RUN echo "@wyre-technology:registry=https://npm.pkg.github.com" > .npmrc && \
-    echo "//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}" >> .npmrc && \
-    npm ci --ignore-scripts && \
-    rm -f .npmrc
+# Install dependencies with GitHub Packages auth.
+#
+# The token can arrive two ways:
+#   1. A BuildKit secret (`--secret id=github_token,env=GITHUB_TOKEN`) — preferred,
+#      because the value never lands in the image's layer history. This is what
+#      docker-compose.yml uses for local builds.
+#   2. The `GITHUB_TOKEN` build arg — required for builders that only support
+#      build-time env vars (DigitalOcean App Platform). The arg is only consumed
+#      in this non-published builder stage.
+# The .npmrc is written and removed inside a single layer either way.
+RUN --mount=type=secret,id=github_token \
+    TOKEN="$(cat /run/secrets/github_token 2>/dev/null || true)"; \
+    [ -n "$TOKEN" ] || TOKEN="${GITHUB_TOKEN}"; \
+    printf '@wyre-technology:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > .npmrc; \
+    npm ci --ignore-scripts; status=$?; \
+    rm -f .npmrc; \
+    exit $status
 
 # Copy source code
 COPY . .
