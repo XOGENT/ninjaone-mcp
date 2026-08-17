@@ -21,6 +21,8 @@ services:
       secrets:
         - github_token
     image: ninjaone-mcp:latest
+    # Local-only tag: never attempt a registry pull, just build it.
+    pull_policy: build
     container_name: ninjaone-mcp-server
     restart: unless-stopped
     env_file:
@@ -122,6 +124,7 @@ services:
       secrets:
         - github_token
     image: ninjaone-mcp:dev
+    pull_policy: build
     container_name: ninjaone-mcp-dev
     working_dir: /app
     restart: "no"
