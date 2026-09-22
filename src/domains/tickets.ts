@@ -6,6 +6,7 @@
 import type { Tool } from "@modelcontextprotocol/server";
 import type { DomainHandler, CallToolResult } from "../utils/types.js";
 import type { TicketStatus, TicketPriority, TicketType } from "@wyre-technology/node-ninjaone";
+import { NinjaOneNotFoundError } from "@wyre-technology/node-ninjaone";
 import { getClient } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 
@@ -70,6 +71,56 @@ function ticketPageCursor(
   const ids = tickets.map((t) => Number(t.id)).filter((n) => Number.isFinite(n));
   return ids.length ? Math.max(...ids) : 0;
 }
+
+/** Parse an ISO 8601 datetime or a bare epoch-millis string into epoch ms. */
+function parseTimestamp(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (trimmed === "") return undefined;
+  const asNumber = Number(trimmed);
+  if (Number.isFinite(asNumber)) return asNumber;
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Extract an entity's timestamp in epoch ms, trying every field name NinjaOne
+ * has been observed to use for it — the board-run response uses `lastUpdated`
+ * on tickets, while the SDK's typed model uses `updateTime`; comment/log-entry
+ * timestamp field naming hasn't been confirmed against live data, so several
+ * plausible names are tried in priority order.
+ */
+function extractTimestamp(
+  entity: Record<string, unknown>,
+  fieldPriority: readonly string[]
+): number | undefined {
+  for (const field of fieldPriority) {
+    const raw = entity[field];
+    if (raw === undefined || raw === null) continue;
+    const value = typeof raw === "number" ? raw : parseTimestamp(String(raw));
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+const TICKET_TIMESTAMP_FIELDS = ["lastUpdated", "updateTime", "modifyTime", "updatedAt"] as const;
+const COMMENT_TIMESTAMP_FIELDS = [
+  "createTime",
+  "created",
+  "createdAt",
+  "timestamp",
+  "date",
+  "lastUpdated",
+  "updateTime",
+] as const;
+
+/**
+ * Hard ceiling on individual getComments calls per ninjaone_tickets_comment_search
+ * invocation, independent of max_tickets_scanned — a board where most scanned
+ * tickets qualify as candidates could otherwise fire hundreds of comment-history
+ * calls in one MCP tool call and time out the caller. Not exposed as a parameter;
+ * narrow since/status/organization_id/device_id to stay under it.
+ */
+const MAX_COMMENT_LOOKUPS = 200;
 
 /**
  * Get ticket domain tools
@@ -242,6 +293,70 @@ function getTools(): Tool[] {
       inputSchema: {
         type: "object" as const,
         properties: {},
+      },
+    },
+    {
+      name: "ninjaone_tickets_comment_search",
+      description:
+        "Find tickets on a board that have a comment posted within a time window, in one call — " +
+        "joins the board's ticket list with each candidate ticket's comment history server-side " +
+        "instead of requiring the caller to page through tickets and fetch comments one by one. " +
+        "Requires board_id and since; optionally filter by status/organization_id/device_id and " +
+        "narrow until (default now). As an optimization, a ticket's comments are only fetched if " +
+        "its own lastUpdated is on/after since — posting a comment always bumps lastUpdated, so a " +
+        "ticket untouched since then cannot have a qualifying comment — but a match still requires " +
+        "an actual comment timestamped inside [since, until], since lastUpdated also changes on " +
+        "status/assignee/etc. changes unrelated to comments. Only entries of type COMMENT are " +
+        "checked, not the full activity log. Scanning is capped (see max_tickets_scanned and the " +
+        "response's scanCapped/commentLookupsCapped flags); pass the returned cursor back to " +
+        "continue a capped scan.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          board_id: {
+            type: "number",
+            description:
+              "Ticket board to search. Use ninjaone_tickets_boards_list to discover valid IDs; " +
+              "if that endpoint is unavailable on your tenant, read the ID from the board's URL " +
+              "in the NinjaOne web UI.",
+          },
+          since: {
+            type: "string",
+            description:
+              "Start of the comment window: ISO 8601 datetime (e.g. 2026-09-01T00:00:00Z) or " +
+              "epoch milliseconds.",
+          },
+          until: {
+            type: "string",
+            description: "End of the comment window, same formats as since. Defaults to now.",
+          },
+          status: {
+            type: "string",
+            enum: ["OPEN", "IN_PROGRESS", "WAITING", "CLOSED"],
+            description:
+              "Filter to tickets in this status, matched the same way as ninjaone_tickets_list.",
+          },
+          organization_id: {
+            type: "number",
+            description: "Filter by organization (ticket clientId).",
+          },
+          device_id: {
+            type: "number",
+            description: "Filter by linked device (ticket nodeId).",
+          },
+          max_tickets_scanned: {
+            type: "number",
+            description:
+              "Cap on how many board tickets to page through in this call (default 500). Lower " +
+              "it and use the returned cursor to scan a very large board in smaller steps.",
+          },
+          cursor: {
+            type: "string",
+            description:
+              "Pagination cursor from a previous scanCapped response, to resume the board scan.",
+          },
+        },
+        required: ["board_id", "since"],
       },
     },
   ];
@@ -445,9 +560,10 @@ async function handleCall(
       } catch (error) {
         // Some tenants 404 on GET /api/v2/ticketing/trigger/board, leaving no
         // API path to discover board IDs — point the caller at the web UI
-        // instead of surfacing a bare "Resource not found".
-        const status = (error as { status?: number }).status;
-        if (status === 404) {
+        // instead of surfacing a bare "Resource not found". The SDK's HTTP
+        // layer throws NinjaOneNotFoundError (statusCode 404, not `.status`)
+        // for this — check the class, not a nonexistent property.
+        if (error instanceof NinjaOneNotFoundError) {
           return {
             content: [
               {
@@ -468,6 +584,162 @@ async function handleCall(
 
       return {
         content: [{ type: "text", text: JSON.stringify(boards, null, 2) }],
+      };
+    }
+
+    case "ninjaone_tickets_comment_search": {
+      const boardId = args.board_id;
+      if (typeof boardId !== "number" || !Number.isFinite(boardId)) {
+        return {
+          content: [{ type: "text", text: "board_id is required." }],
+          isError: true,
+        };
+      }
+
+      const sinceRaw = args.since as string | undefined;
+      const since = sinceRaw !== undefined ? parseTimestamp(sinceRaw) : undefined;
+      if (since === undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "since is required and must be an ISO 8601 datetime or epoch-millis string.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const untilRaw = args.until as string | undefined;
+      const until = untilRaw !== undefined ? parseTimestamp(untilRaw) : Date.now();
+      if (until === undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "until could not be parsed as an ISO 8601 datetime or epoch-millis string.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const statusFilter = args.status as string | undefined;
+      const organizationId = args.organization_id as number | undefined;
+      const deviceId = args.device_id as number | undefined;
+      const maxTicketsScanned = (args.max_tickets_scanned as number) || 500;
+      const pageSize = 50;
+
+      logger.info("API call: tickets.commentSearch", {
+        boardId,
+        since,
+        until,
+        status: statusFilter,
+        organizationId,
+        deviceId,
+        maxTicketsScanned,
+      });
+
+      let cursor = args.cursor !== undefined ? Number(args.cursor) : undefined;
+      let totalScanned = 0;
+      let scanCapped = false;
+      const candidates: Array<Record<string, unknown>> = [];
+
+      // Page through the board, keeping tickets that pass the same status/
+      // organization/device filters as ninjaone_tickets_list AND whose own
+      // lastUpdated is on/after `since` — a ticket untouched since then cannot
+      // have a comment posted since then either.
+      while (totalScanned < maxTicketsScanned) {
+        const response = await client.tickets.list({
+          boardId,
+          pageSize,
+          lastCursorId: cursor,
+        });
+        const rawTickets = extractTickets(response);
+        totalScanned += rawTickets.length;
+
+        for (const ticket of rawTickets) {
+          if (!ticketMatchesFilters(ticket, statusFilter, organizationId, deviceId)) continue;
+          const ticketTimestamp = extractTimestamp(ticket, TICKET_TIMESTAMP_FIELDS);
+          if (ticketTimestamp === undefined || ticketTimestamp >= since) {
+            candidates.push(ticket);
+          }
+        }
+
+        const hasMore = rawTickets.length === pageSize;
+        if (!hasMore) break;
+        cursor = ticketPageCursor(response, rawTickets);
+        if (totalScanned >= maxTicketsScanned) {
+          scanCapped = true;
+          break;
+        }
+      }
+
+      // Fetch comment history only for candidates, capped independently so a
+      // board where most scanned tickets qualify can't fire hundreds of
+      // getComments calls (and risk the tool call timing out) in one invocation.
+      let commentLookupsCapped = false;
+      let lookupsDone = 0;
+      const matched: Array<Record<string, unknown>> = [];
+      for (const ticket of candidates) {
+        if (lookupsDone >= MAX_COMMENT_LOOKUPS) {
+          commentLookupsCapped = true;
+          break;
+        }
+        lookupsDone++;
+        const ticketId = Number(ticket.id);
+        if (!Number.isFinite(ticketId)) continue;
+
+        const comments = (await client.tickets.getComments(
+          ticketId,
+          "COMMENT"
+        )) as unknown as Array<Record<string, unknown>>;
+        const matchingComments = comments.filter((comment) => {
+          const t = extractTimestamp(comment, COMMENT_TIMESTAMP_FIELDS);
+          return t !== undefined && t >= since && t <= until;
+        });
+        if (matchingComments.length > 0) {
+          matched.push({ ...ticket, matchingComments });
+        }
+      }
+
+      logger.debug("API response: tickets.commentSearch", {
+        ticketsScanned: totalScanned,
+        candidates: candidates.length,
+        commentLookupsDone: lookupsDone,
+        matched: matched.length,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                tickets: matched,
+                count: matched.length,
+                ticketsScanned: totalScanned,
+                candidatesChecked: lookupsDone,
+                window: {
+                  since: new Date(since).toISOString(),
+                  until: new Date(until).toISOString(),
+                },
+                scanCapped,
+                commentLookupsCapped,
+                cursor: scanCapped ? String(cursor ?? "") : undefined,
+                note:
+                  "A ticket's comments are only checked if its own lastUpdated is on/after " +
+                  "`since` (posting a comment always bumps lastUpdated). A match requires an " +
+                  "actual COMMENT-type entry timestamped inside [since, until] — not just any " +
+                  "activity. If scanCapped or commentLookupsCapped is true, results are " +
+                  "incomplete: narrow the filters/window, or pass `cursor` back to continue the " +
+                  "board scan from where this call stopped.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
 
