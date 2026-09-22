@@ -59,6 +59,28 @@ vi.mock("../../utils/client.js", () => ({
   }),
 }));
 
+// Mirror the real SDK's error shape (statusCode, not status — see
+// @wyre-technology/node-ninjaone src/errors.ts) so this test actually
+// exercises the `instanceof` check in the handler instead of a shape that
+// only the test believes in.
+const { NinjaOneNotFoundError } = vi.hoisted(() => {
+  class NinjaOneNotFoundError extends Error {
+    readonly statusCode = 404;
+    readonly response: unknown;
+    constructor(message: string, response?: unknown) {
+      super(message);
+      this.name = "NinjaOneNotFoundError";
+      this.response = response;
+      Object.setPrototypeOf(this, NinjaOneNotFoundError.prototype);
+    }
+  }
+  return { NinjaOneNotFoundError };
+});
+
+vi.mock("@wyre-technology/node-ninjaone", () => ({
+  NinjaOneNotFoundError,
+}));
+
 // Import handler after mocking
 import { ticketsHandler } from "../../domains/tickets.js";
 
@@ -115,7 +137,7 @@ describe("Tickets Domain Handler", () => {
     it("should return all ticket tools", () => {
       const tools = ticketsHandler.getTools();
 
-      expect(tools.length).toBe(7);
+      expect(tools.length).toBe(8);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("ninjaone_tickets_list");
@@ -125,6 +147,7 @@ describe("Tickets Domain Handler", () => {
       expect(toolNames).toContain("ninjaone_tickets_add_comment");
       expect(toolNames).toContain("ninjaone_tickets_comments");
       expect(toolNames).toContain("ninjaone_tickets_boards_list");
+      expect(toolNames).toContain("ninjaone_tickets_comment_search");
     });
 
     it("ninjaone_tickets_list should require board_id", () => {
@@ -423,9 +446,9 @@ describe("Tickets Domain Handler", () => {
       });
 
       it("should return actionable guidance when the boards endpoint 404s", async () => {
-        const notFound = Object.assign(new Error("Resource not found"), {
-          name: "NinjaOneNotFoundError",
-          status: 404,
+        const notFound = new NinjaOneNotFoundError("Resource not found", {
+          resultCode: "FAILURE",
+          errorMessage: "HTTP 404 Not Found",
         });
         mockTicketsListBoards.mockRejectedValueOnce(notFound);
 
@@ -434,6 +457,143 @@ describe("Tickets Domain Handler", () => {
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("404");
         expect(result.content[0].text).toContain("web UI");
+      });
+    });
+
+    describe("ninjaone_tickets_comment_search", () => {
+      it("should require board_id", async () => {
+        const result = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          since: "2026-01-01T00:00:00Z",
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("board_id");
+      });
+
+      it("should require a parseable since", async () => {
+        const missing = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+        });
+        expect(missing.isError).toBe(true);
+        expect(missing.content[0].text).toContain("since");
+
+        const unparseable = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+          since: "not-a-date",
+        });
+        expect(unparseable.isError).toBe(true);
+        expect(unparseable.content[0].text).toContain("since");
+      });
+
+      it("should only fetch comments for candidates updated on/after since, and match on comment timestamp within the window", async () => {
+        mockTicketsList.mockResolvedValueOnce({
+          data: [
+            // Candidate: updated after `since`, has a comment inside the window → matched
+            {
+              id: 1,
+              status: { displayName: "Closed" },
+              lastUpdated: "2026-01-10T00:00:00Z",
+            },
+            // Candidate: updated after `since`, but no comment falls inside the window → not matched
+            {
+              id: 2,
+              status: { displayName: "Closed" },
+              lastUpdated: "2026-01-11T00:00:00Z",
+            },
+            // Not a candidate: untouched since before `since` → getComments must not be called
+            {
+              id: 3,
+              status: { displayName: "Closed" },
+              lastUpdated: "2025-01-01T00:00:00Z",
+            },
+            // Filtered out entirely: wrong status
+            {
+              id: 4,
+              status: { displayName: "Open" },
+              lastUpdated: "2026-01-12T00:00:00Z",
+            },
+          ],
+        });
+
+        mockTicketsGetComments.mockResolvedValueOnce([
+          { id: 100, body: "in window", createTime: "2026-01-10T12:00:00Z" },
+        ]);
+        mockTicketsGetComments.mockResolvedValueOnce([
+          { id: 101, body: "before window", createTime: "2025-06-01T00:00:00Z" },
+        ]);
+
+        const result = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+          status: "CLOSED",
+          since: "2026-01-01T00:00:00Z",
+          until: "2026-01-31T00:00:00Z",
+        });
+
+        expect(result.isError).toBeUndefined();
+        const data = JSON.parse(result.content[0].text);
+
+        expect(data.ticketsScanned).toBe(4);
+        expect(data.candidatesChecked).toBe(2);
+        expect(mockTicketsGetComments).toHaveBeenCalledTimes(2);
+        expect(mockTicketsGetComments).toHaveBeenNthCalledWith(1, 1, "COMMENT");
+        expect(mockTicketsGetComments).toHaveBeenNthCalledWith(2, 2, "COMMENT");
+
+        expect(data.count).toBe(1);
+        expect(data.tickets[0].id).toBe(1);
+        expect(data.tickets[0].matchingComments).toHaveLength(1);
+        expect(data.scanCapped).toBe(false);
+        expect(data.commentLookupsCapped).toBe(false);
+      });
+
+      it("should page through the board until exhausted, accumulating scanned count across pages", async () => {
+        const fullPage = Array.from({ length: 50 }, (_, i) => ({
+          id: i + 1,
+          status: { displayName: "Closed" },
+          lastUpdated: "2026-01-10T00:00:00Z",
+        }));
+        const lastPage = [
+          { id: 51, status: { displayName: "Closed" }, lastUpdated: "2026-01-10T00:00:00Z" },
+        ];
+        mockTicketsList.mockResolvedValueOnce({ data: fullPage });
+        mockTicketsList.mockResolvedValueOnce({ data: lastPage });
+        mockTicketsGetComments.mockResolvedValue([]);
+
+        const result = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+          status: "CLOSED",
+          since: "2026-01-01T00:00:00Z",
+        });
+
+        const data = JSON.parse(result.content[0].text);
+        expect(mockTicketsList).toHaveBeenCalledTimes(2);
+        expect(mockTicketsList).toHaveBeenNthCalledWith(2, {
+          boardId: 1006,
+          pageSize: 50,
+          lastCursorId: 50,
+        });
+        expect(data.ticketsScanned).toBe(51);
+        expect(data.scanCapped).toBe(false);
+      });
+
+      it("should cap scanning at max_tickets_scanned and return a resumable cursor", async () => {
+        const fullPage = Array.from({ length: 50 }, (_, i) => ({
+          id: i + 1,
+          status: { displayName: "Closed" },
+          lastUpdated: "2026-01-10T00:00:00Z",
+        }));
+        mockTicketsList.mockResolvedValueOnce({ data: fullPage });
+        mockTicketsGetComments.mockResolvedValue([]);
+
+        const result = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+          since: "2026-01-01T00:00:00Z",
+          max_tickets_scanned: 50,
+        });
+
+        const data = JSON.parse(result.content[0].text);
+        expect(mockTicketsList).toHaveBeenCalledTimes(1);
+        expect(data.scanCapped).toBe(true);
+        expect(data.cursor).toBe("50");
       });
     });
 
