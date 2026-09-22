@@ -87,7 +87,7 @@ services:
   # Apple Silicon — fine for local use, a little slower to start.
   ninjaone-mcp-prebuilt:
     profiles: ["prebuilt"]
-    image: ${PREBUILT_IMAGE:-ghcr.io/wyre-technology/ninjaone-mcp:latest}
+    image: ${PREBUILT_IMAGE:-ghcr.io/xogent/ninjaone-mcp:latest}
     platform: ${PREBUILT_PLATFORM:-linux/amd64}
     container_name: ninjaone-mcp-prebuilt
     restart: unless-stopped

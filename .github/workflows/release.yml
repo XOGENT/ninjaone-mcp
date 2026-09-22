@@ -25,7 +25,7 @@ jobs:
     uses: wyre-technology/.github/.github/workflows/mcp-server-release.yml@d28a612a00a1bd0c36aff09e686ce2d1e10ef552
     with:
       server-name: ninjaone-mcp
-      image-name: ghcr.io/wyre-technology/ninjaone-mcp
+      image-name: ghcr.io/xogent/ninjaone-mcp
     secrets: inherit
 
   deploy:
@@ -37,7 +37,7 @@ jobs:
     uses: wyre-technology/.github/.github/workflows/mcp-server-deploy.yml@a61021de876d0fd44dac777fa90f963fea25b0c3
     with:
       vendor-slug: ninjaone
-      image-name: ghcr.io/wyre-technology/ninjaone-mcp
+      image-name: ghcr.io/xogent/ninjaone-mcp
       digest: ${{ needs.release.outputs.digest }}
       version: ${{ needs.release.outputs.version }}
     secrets: inherit
