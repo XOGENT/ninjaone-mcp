@@ -2,7 +2,6 @@
 #
 # Quick start:
 #   cp .env.example .env          # fill in your NinjaOne credentials
-#   export GITHUB_TOKEN=$(gh auth token)   # read:packages, needed at BUILD time
 #   docker compose up --build
 #
 # The server then listens on http://localhost:8080/mcp (health: /health).
@@ -14,12 +13,6 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
-      # The @wyre-technology/node-ninjaone dependency lives on GitHub Packages,
-      # which has no anonymous read. The token is passed as a BuildKit secret so
-      # it never lands in the image layers. Accepts GITHUB_TOKEN or the
-      # NODE_AUTH_TOKEN name used by .npmrc / CI.
-      secrets:
-        - github_token
     image: ninjaone-mcp:latest
     # Local-only tag: never attempt a registry pull, just build it.
     pull_policy: build
@@ -121,8 +114,6 @@ services:
       context: .
       dockerfile: Dockerfile
       target: builder
-      secrets:
-        - github_token
     image: ninjaone-mcp:dev
     pull_policy: build
     container_name: ninjaone-mcp-dev
@@ -157,12 +148,6 @@ services:
       - ninjaone-mcp-dev-logs:/app/logs
     stdin_open: true
     tty: true
-
-secrets:
-  github_token:
-    # Read from the GITHUB_TOKEN variable — exported in your shell or set in
-    # .env. Needs the read:packages scope; only used at build time.
-    environment: GITHUB_TOKEN
 
 volumes:
   ninjaone-mcp-logs:

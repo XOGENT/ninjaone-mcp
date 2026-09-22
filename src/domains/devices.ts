@@ -4,7 +4,7 @@
  * Provides tools for device operations in NinjaOne.
  */
 import type { Tool } from "@modelcontextprotocol/server";
-import type { DeviceNodeClass } from "@wyre-technology/node-ninjaone";
+import type { DeviceNodeClass } from "@xogent/node-ninjaone";
 import type { DomainHandler, CallToolResult } from "../utils/types.js";
 import { getClient } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
