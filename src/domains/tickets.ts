@@ -5,8 +5,8 @@
  */
 import type { Tool } from "@modelcontextprotocol/server";
 import type { DomainHandler, CallToolResult } from "../utils/types.js";
-import type { TicketStatus, TicketPriority, TicketType } from "@wyre-technology/node-ninjaone";
-import { NinjaOneNotFoundError } from "@wyre-technology/node-ninjaone";
+import type { TicketStatus, TicketPriority, TicketType } from "@xogent/node-ninjaone";
+import { NinjaOneNotFoundError } from "@xogent/node-ninjaone";
 import { getClient } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 
@@ -72,12 +72,25 @@ function ticketPageCursor(
   return ids.length ? Math.max(...ids) : 0;
 }
 
-/** Parse an ISO 8601 datetime or a bare epoch-millis string into epoch ms. */
+/**
+ * Coerce a bare epoch number to milliseconds.
+ *
+ * NinjaOne reports ticket `lastUpdated` and log-entry `createTime` as fractional
+ * epoch *seconds* (e.g. 1790091031.785), while Date.parse and epoch-millis
+ * inputs are milliseconds. Comparing the two unconverted reads every ticket as
+ * 1970 and matches nothing. Anything below 1e12 is seconds: 1e12 milliseconds
+ * is 2001, and epoch seconds do not reach 1e12 until the year 33658.
+ */
+function toEpochMillis(value: number): number {
+  return value < 1e12 ? value * 1000 : value;
+}
+
+/** Parse an ISO 8601 datetime or a bare epoch (seconds or millis) into epoch ms. */
 function parseTimestamp(value: string): number | undefined {
   const trimmed = value.trim();
   if (trimmed === "") return undefined;
   const asNumber = Number(trimmed);
-  if (Number.isFinite(asNumber)) return asNumber;
+  if (Number.isFinite(asNumber)) return toEpochMillis(asNumber);
   const parsed = Date.parse(trimmed);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
@@ -96,7 +109,7 @@ function extractTimestamp(
   for (const field of fieldPriority) {
     const raw = entity[field];
     if (raw === undefined || raw === null) continue;
-    const value = typeof raw === "number" ? raw : parseTimestamp(String(raw));
+    const value = typeof raw === "number" ? toEpochMillis(raw) : parseTimestamp(String(raw));
     if (value !== undefined) return value;
   }
   return undefined;

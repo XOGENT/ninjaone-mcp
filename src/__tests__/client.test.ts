@@ -31,7 +31,7 @@ const { NinjaOneClientMock, constructedConfigs } = vi.hoisted(() => ({
 }));
 
 // Mock the node-ninjaone library
-vi.mock("@wyre-technology/node-ninjaone", () => ({
+vi.mock("@xogent/node-ninjaone", () => ({
   NinjaOneClient: NinjaOneClientMock,
 }));
 

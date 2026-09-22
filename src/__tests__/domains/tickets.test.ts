@@ -60,7 +60,7 @@ vi.mock("../../utils/client.js", () => ({
 }));
 
 // Mirror the real SDK's error shape (statusCode, not status — see
-// @wyre-technology/node-ninjaone src/errors.ts) so this test actually
+// @xogent/node-ninjaone src/errors.ts) so this test actually
 // exercises the `instanceof` check in the handler instead of a shape that
 // only the test believes in.
 const { NinjaOneNotFoundError } = vi.hoisted(() => {
@@ -77,7 +77,7 @@ const { NinjaOneNotFoundError } = vi.hoisted(() => {
   return { NinjaOneNotFoundError };
 });
 
-vi.mock("@wyre-technology/node-ninjaone", () => ({
+vi.mock("@xogent/node-ninjaone", () => ({
   NinjaOneNotFoundError,
 }));
 
@@ -543,6 +543,30 @@ describe("Tickets Domain Handler", () => {
         expect(data.tickets[0].matchingComments).toHaveLength(1);
         expect(data.scanCapped).toBe(false);
         expect(data.commentLookupsCapped).toBe(false);
+      });
+
+      it("should treat NinjaOne's fractional epoch-SECONDS timestamps as seconds, not millis", async () => {
+        // Real board rows carry lastUpdated as fractional epoch seconds
+        // (1790091031.785 = 2026-09-22), and log entries carry createTime the
+        // same way. Read as millis these land in 1970 and nothing ever matches.
+        mockTicketsList.mockResolvedValueOnce({
+          data: [{ id: 42, status: { displayName: "Closed" }, lastUpdated: 1790091031.785491 }],
+        });
+        mockTicketsGetComments.mockResolvedValueOnce([
+          { id: 90631, type: "COMMENT", body: "hi", createTime: 1790091031.785491 },
+        ]);
+
+        const result = await ticketsHandler.handleCall("ninjaone_tickets_comment_search", {
+          board_id: 1006,
+          status: "CLOSED",
+          since: "2026-09-01T00:00:00Z",
+          until: "2026-10-01T00:00:00Z",
+        });
+
+        const data = JSON.parse(result.content[0].text);
+        expect(data.candidatesChecked).toBe(1);
+        expect(data.count).toBe(1);
+        expect(data.tickets[0].id).toBe(42);
       });
 
       it("should page through the board until exhausted, accumulating scanned count across pages", async () => {

@@ -5,7 +5,6 @@ FROM node:26-alpine AS builder
 ARG VERSION="unknown"
 ARG COMMIT_SHA="unknown"
 ARG BUILD_DATE="unknown"
-ARG GITHUB_TOKEN
 
 # Set working directory
 WORKDIR /app
@@ -13,23 +12,16 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies with GitHub Packages auth.
+# Install dependencies.
 #
-# The token can arrive two ways:
-#   1. A BuildKit secret (`--secret id=github_token,env=GITHUB_TOKEN`) — preferred,
-#      because the value never lands in the image's layer history. This is what
-#      docker-compose.yml uses for local builds.
-#   2. The `GITHUB_TOKEN` build arg — required for builders that only support
-#      build-time env vars (DigitalOcean App Platform). The arg is only consumed
-#      in this non-published builder stage.
-# The .npmrc is written and removed inside a single layer either way.
-RUN --mount=type=secret,id=github_token \
-    TOKEN="$(cat /run/secrets/github_token 2>/dev/null || true)"; \
-    [ -n "$TOKEN" ] || TOKEN="${GITHUB_TOKEN}"; \
-    printf '@wyre-technology:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > .npmrc; \
-    npm ci --ignore-scripts; status=$?; \
-    rm -f .npmrc; \
-    exit $status
+# @xogent/node-ninjaone is a public git dependency rather than a registry
+# package, which needs two things alpine doesn't give us by default: git itself,
+# and an https rewrite — npm records GitHub git deps in the lockfile as
+# git+ssh://git@github.com/..., and a container has no SSH key to clone with.
+# Nothing here needs a registry token: every remaining dependency is public.
+RUN apk add --no-cache git \
+ && git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
+ && npm ci --ignore-scripts
 
 # Copy source code
 COPY . .
